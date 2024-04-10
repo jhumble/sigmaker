@@ -1,0 +1,3 @@
+suffix-tree @ git+https://github.com/jhumble/suffix-tree.git
+yara-python
+graphviz
