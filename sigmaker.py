@@ -202,7 +202,17 @@ class Sigmaker:
             graph = self.tree.root.to_dot()
             self.logger.warning(f'[+]\tSaving graph to {self.graph_path}')
             source = graphviz.Source(graph, filename=self.graph_path, format='png')
-            source.view()
+            # render() is what actually writes the image; view=True additionally
+            # launches a viewer.  Only do that when there is a display to launch
+            # it on -- on a headless analysis server it would block or fail.
+            has_display = bool(os.environ.get('DISPLAY') or
+                               os.environ.get('WAYLAND_DISPLAY'))
+            rendered = source.render(view=has_display)
+            self.logger.warning(f'[+]\tGraph rendered to {rendered}')
+            if not has_display:
+                self.logger.warning(
+                    '[+]\tNeither DISPLAY nor WAYLAND_DISPLAY is set; '
+                    'wrote the graph without opening a viewer')
                 
 
         i = 0

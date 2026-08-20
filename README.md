@@ -55,6 +55,7 @@ Common options:
 | `-s N` | cap the rule at N strings |
 | `-P NAME` | pattern name prefix, e.g. `-P auto` gives `$auto_000` |
 | `-B N` | only read the first N bytes of each input file |
+| `-g PATH` | write a graphviz rendering of the suffix tree to PATH and PATH.png. Only opens a viewer when `DISPLAY` or `WAYLAND_DISPLAY` is set, so it is safe on a headless server |
 | `-R` | use the recursive tree traversal (see below) |
 
 ## Which interpreter
