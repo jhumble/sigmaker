@@ -1,3 +1,6 @@
-suffix-tree @ git+https://github.com/jhumble/suffix-tree.git
+# Runtime dependencies.  The suffix-tree fork is NOT listed here: tools/setup.sh
+# installs it from the nested ./suffix-tree checkout when present so that local
+# fixes are picked up, and only falls back to GitHub when that checkout is
+# missing.  See README.md.
 yara-python
 graphviz

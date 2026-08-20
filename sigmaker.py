@@ -1,5 +1,6 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import hashlib
+import os
 import tempfile
 import time
 import datetime
@@ -7,6 +8,7 @@ import graphviz
 import yara
 import logging
 import re
+import uuid
 from binascii import hexlify, unhexlify
 from argparse import ArgumentParser
 from suffix_tree import Tree
@@ -45,6 +47,8 @@ def parse_args():
       help="Max strings in output yara rule. If more than this number of common strings are found, progressively tighter filters (entropy and %% null bytes) are applied if using -f or the strings are sorted from most to least prevalent and chopped to this # without -f")
     arg_parser.add_argument("-b", "--benign", dest="benign", action="append", default=[],
       help="directory full of benign files to use for excluding noisy strings. Can specify multiple times to use additional directories")
+    arg_parser.add_argument("-P", "--prefix", dest="prefix", action="store", default="auto",
+      help="Prefix for pattern names (e.g., 'auto' produces $auto_000, $auto_001). Default: 'auto'")
     arg_parser.add_argument('files', nargs='+')
     return arg_parser.parse_args()
 
@@ -109,15 +113,17 @@ class Sigmaker:
                 strings.pop(d)
         return strings
 
-    def build_rule(self, strings, hashes=[], rule_name='', reference='', tags=[]):
+    def build_rule(self, strings, hashes=[], rule_name='', reference='', tags=[], prefix='auto'):
         i = 0
         date = datetime.datetime.now().isoformat().split('T')[0]
+        rule_uuid = str(uuid.uuid4())
         if tags:
             tags = ': ' + ' '.join(tags)
         else:
             tags = ''
         meta = f"""
     meta:
+        uuid = "{rule_uuid}"
         tlp = "amber"
         author = "Jeremy Humble" 
         date = "{date}"
@@ -131,7 +137,7 @@ class Sigmaker:
         output += meta
         output += '\n    strings:\n'
         for string in strings:
-            output += f'        $str_{i:03} = {self.emit_string(string["string"])} // {string["percent"]*100:.01f}%"\n' 
+            output += f'        ${prefix}_{i:03} = {self.emit_string(string["string"])} // {string["percent"]*100:.01f}%\n' 
             i+= 1
         output += '\n    condition:\n        any of them\n}'
         return output
@@ -139,12 +145,13 @@ class Sigmaker:
                 
         
     def emit_string(self, string):
-        printable_wide = re.compile(rb'^([\x09\x0d\x0a\x20-\x7e]\x00)*$')
+        printable_wide = re.compile(rb'^([\x00\x09\x0d\x0a\x20-\x7e]\x00)*$')
         if percent_printable(string) < .66:
             return f'{{{format_hex(string)}}}'
-        if printable_wide.match(string):
+        # we are potentially removing useful bytes for detection here, but in most cases this is unlikely and this allows for much cleaner looking rules for many utf16 strings
+        if printable_wide.match(string.lstrip(b'\x00')):
             try:
-                rtn = yara_escape(string.decode("utf-16le").encode())
+                rtn = yara_escape(string.lstrip(b'\x00').decode("utf-16le").encode())
                 return f'"{rtn}" wide'
             except Exception as e:
                 self.logger.warning(f'Failed to decode {string} as utf16-le: {e}')
@@ -158,15 +165,22 @@ class Sigmaker:
             exit()
              
 
-    def process(self, args, benign_dirs=[], recursive=False, output_path=None, rule_name='', reference='', tags=[]):
+    def process(self, args, benign_dirs=[], recursive=False, output_path=None, rule_name='', reference='', tags=[], prefix='auto'):
         path_to_data = {}
         strings = []
         paths = []
         hashes = []
         total_bytes = 0
         for arg in args:
-            for path in recursive_all_files(arg): 
-                paths.append(path)
+            matched = recursive_all_files(arg)
+            if not matched:
+                self.logger.warning(f'No files matched input {arg!r}')
+            paths.extend(matched)
+        if not paths:
+            raise SystemExit(
+                f'No input files matched {args}. Nothing to build a signature '
+                f'from -- check the paths are correct and relative to the '
+                f'current directory ({os.getcwd()}).')
         for path in paths:
             with open(path, 'rb') as fp:
                 data = fp.read()
@@ -188,7 +202,7 @@ class Sigmaker:
             graph = self.tree.root.to_dot()
             self.logger.warning(f'[+]\tSaving graph to {self.graph_path}')
             source = graphviz.Source(graph, filename=self.graph_path, format='png')
-            #source.view()
+            source.view()
                 
 
         i = 0
@@ -203,10 +217,18 @@ class Sigmaker:
             self.logger.debug(f'k: {k}, path: {path}')
             s = bytearray(path.S[path.start: path.end]) # self.S[self.start : self.end]
             #self.logger.debug(f'K: {k}, string: {s}')
-            if path and k/len(paths) > self.percent and k > 1 and len(s) >= self.minimum and len(s) <= self.maximum:
-                strings.append({'count': k, 'percent': k/len(paths), 'string': s})
+            if path and k/len(paths) >= self.percent and k > 1 and len(s) >= self.minimum:
+                if len(s) <= self.maximum:
+                    strings.append({'count': k, 'percent': k/len(paths), 'string': s})
+                else:
+                    # Split long strings into chunks of maximum length
+                    for i in range(0, len(s), self.maximum):
+                        chunk = s[i:i + self.maximum]
+                        if len(chunk) >= self.minimum:
+                            self.logger.debug(f'Splitting long string ({len(s)} bytes) into chunk: {chunk}')
+                            strings.append({'count': k, 'percent': k/len(paths), 'string': chunk})
             else:
-                self.logger.debug(f'Filtered out {s}')
+                self.logger.debug(f'Filtered out {s}. Path: {path}, k/len(paths): {k/len(paths)}, k: {k}')
 
         """
         print(f'[+] Recursion: {recursive}')
@@ -251,7 +273,7 @@ class Sigmaker:
             fp.write('\n'.join([str(string) for string in strings]))
             self.logger.info(f'Strings written to {fp.name}')
 
-        rule_text = self.build_rule(strings, hashes=hashes, rule_name=rule_name, reference=reference, tags=tags)
+        rule_text = self.build_rule(strings, hashes=hashes, rule_name=rule_name, reference=reference, tags=tags, prefix=prefix)
         with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.yar') as fp:
             fp.write(rule_text)
             self.logger.info(f'Yara rule (Before benign filtering) written to {fp.name}')
@@ -273,7 +295,7 @@ class Sigmaker:
                 self.logger.debug(f'Scanning {path}')
                 for match in rule.match(path):
                     for offset, name, data in iterate_matches(match.strings):
-                            _id = int(name.split('_')[1])
+                            _id = int(name.split('_')[-1])  # Use [-1] to handle prefixes with underscores
                             to_remove.add(_id)
         self.logger.debug(f'Removing {to_remove}')
         for _id in sorted(list(to_remove ), reverse=True):
@@ -281,10 +303,12 @@ class Sigmaker:
                 del strings[_id]
             except Exception as e:
                 self.logger.critical(f'Failed to remove {_id}: {e}')
+        self.logger.info(f'{len(strings)} remain after yara filtering')
         #write filtered rule
-        rule = self.build_rule(strings, hashes=hashes, rule_name=rule_name, reference=reference, tags=tags)
+        rule = self.build_rule(strings, hashes=hashes, rule_name=rule_name, reference=reference, tags=tags, prefix=prefix)
         if not output_path:
             with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.yar') as fp:
+                output_path = fp.name
                 fp.write(rule)
         else:
             with open(output_path, 'w') as fp:
@@ -303,7 +327,7 @@ if __name__ == '__main__':
                     options.graph_path, 
                     options.strings,
                     options.filter)
-    sm.process(options.files, options.benign, recursive=options.recursive, output_path=options.output, rule_name=options.name, reference=options.reference, tags=options.tags)
+    sm.process(options.files, options.benign, recursive=options.recursive, output_path=options.output, rule_name=options.name, reference=options.reference, tags=options.tags, prefix=options.prefix)
 
     """
     for recurse in [False, True]:

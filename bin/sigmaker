@@ -1,0 +1,17 @@
+#!/bin/sh
+# sigmaker entry point.
+#
+# readlink -f resolves symlinks, so this can be symlinked from /usr/local/bin
+# and still find its own virtualenv.  exec preserves the exit code and signal
+# handling.  No `activate`, no hardcoded home directory, no dependence on which
+# python happens to be first on PATH.
+set -e
+
+DIR=$(readlink -f "$(dirname "$(readlink -f "$0")")/..")
+
+if [ ! -x "$DIR/venv/bin/python" ]; then
+    echo "sigmaker: no virtualenv at $DIR/venv -- run $DIR/tools/setup.sh first" >&2
+    exit 1
+fi
+
+exec "$DIR/venv/bin/python" "$DIR/sigmaker.py" "$@"

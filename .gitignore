@@ -1,0 +1,24 @@
+# Virtualenv — created by tools/setup.sh, never committed.
+venv/
+.venv/
+
+# The suffix-tree fork is a SEPARATE git repo checked out here, deliberately not
+# a submodule (there is no .gitmodules).  Ignoring it keeps git from turning it
+# into a gitlink.  tools/setup.sh installs from it when present and falls back
+# to github.com/jhumble/suffix-tree when it is not.
+suffix-tree/
+
+# Python bytecode / build output
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+
+# Editor
+*.swp
+*.swo
+
+# Local scratch
+*.yar.tmp

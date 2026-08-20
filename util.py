@@ -1,3 +1,4 @@
+import glob
 import logging
 import math
 import os
@@ -27,7 +28,12 @@ def recursive_all_files(directory, ext_filter=None):
             try:
                 dir_content = os.listdir(directory)
             except Exception as e:
-                #print 'Exception listing contents of %s. Skipping' % (directory)
+                # Not a file, not a glob, and not a listable directory: the
+                # caller asked for something that is not there.  Say so --
+                # silently returning [] here is how an empty input set used to
+                # reach the tree builder unnoticed.
+                logging.getLogger('Sigmaker').warning(
+                    f'Cannot read {directory}: {e}. Skipping')
                 return []
 
     for f in dir_content:
