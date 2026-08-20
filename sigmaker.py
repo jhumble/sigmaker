@@ -61,6 +61,30 @@ def physical_cores():
 # yourself.
 DEFAULT_WORKERS = min(8, max(1, physical_cores() // 2))
 
+# Peak RSS scales linearly with total input size.  Measured across nine runs on
+# three malpedia families at 1/4/8 MB: 499 MB per MB of input plus a ~25 MB fixed
+# cost, with under 5% spread between families.  Rounded up for headroom, because
+# underestimating here gets the process OOM-killed after several minutes of work
+# while overestimating only produces a warning.
+MEMORY_BYTES_PER_INPUT_BYTE = 550
+
+
+def available_memory():
+    """Bytes of memory we can expect to get, or None if that cannot be read.
+
+    MemAvailable rather than MemFree: page cache is reclaimable, so MemFree
+    understates what is actually obtainable, often by a lot.
+    """
+    try:
+        with open('/proc/meminfo') as fp:
+            for line in fp:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 _worker_rule = None
 
 
@@ -118,6 +142,8 @@ def parse_args():
       help="Max strings in output yara rule. If more than this number of common strings are found, progressively tighter filters (entropy and %% null bytes) are applied if using -f or the strings are sorted from most to least prevalent and chopped to this # without -f")
     arg_parser.add_argument("-b", "--benign", dest="benign", action="append", default=[],
       help="directory full of benign files to use for excluding noisy strings. Can specify multiple times to use additional directories")
+    arg_parser.add_argument("--ignore-memory-limit", dest="ignore_memory", action="store_true", default=False,
+      help="Proceed even when the estimated peak memory exceeds what is available. The estimate is a linear model, not a measurement, so this is an escape hatch for the cases where it is wrong")
     arg_parser.add_argument("-j", "--parallel", dest="parallel", type=int, action="store", default=DEFAULT_WORKERS,
       help=f"Worker processes to use for the benign-file scan, which dominates runtime. 1 disables multiprocessing. Default on this machine: {DEFAULT_WORKERS}")
     arg_parser.add_argument("-P", "--prefix", dest="prefix", action="store", default="auto",
@@ -131,12 +157,13 @@ def parse_args():
 class Sigmaker:
     # http://www.cs.ucf.edu/courses/cap5937/fall2004/Applications%20of%20suffix%20trees.pdf
 
-    def __init__(self, percent=51, minimum=5, maximum=128, bytes_to_read=0, max_strings=9999, string_filter=False, parallel=DEFAULT_WORKERS):
+    def __init__(self, percent=51, minimum=5, maximum=128, bytes_to_read=0, max_strings=9999, string_filter=False, parallel=DEFAULT_WORKERS, ignore_memory=False):
         self.logger = logging.getLogger('Sigmaker')
         self.tree = None
         if parallel < 1:
             raise ValueError(f'Invalid parallel option: {parallel}. Must be >= 1')
         self.parallel = parallel
+        self.ignore_memory = ignore_memory
         self.strings = []
         self.null_filter = .8
         self.entropy_filter = 2.5
@@ -240,6 +267,45 @@ class Sigmaker:
             exit()
              
 
+    def check_memory(self, total_bytes, n_files):
+        """Warn or bail out when the tree will not fit in memory.
+
+        The suffix tree is roughly 500x the size of its input, so it is very easy
+        to ask for a run that cannot finish.  Failing here costs a second;
+        failing by OOM costs however long the build ran first, and takes the
+        rest of the machine down with it on a shared box.
+        """
+        estimate = total_bytes * MEMORY_BYTES_PER_INPUT_BYTE
+        available = available_memory()
+        self.logger.info(f'Estimated peak memory: {human_size(estimate)}')
+
+        if available is None:
+            self.logger.warning('Could not read MemAvailable; skipping the memory check')
+            return
+
+        def budget_advice(fraction):
+            safe_total = int(available * fraction / MEMORY_BYTES_PER_INPUT_BYTE)
+            per_file = max(1, safe_total // max(1, n_files))
+            return (f'About {human_size(safe_total)} of input fits in '
+                    f'{human_size(available)}; across {n_files} files that is '
+                    f'roughly -B {per_file}.')
+
+        if estimate > available:
+            message = (
+                f'This run needs about {human_size(estimate)} of memory but only '
+                f'{human_size(available)} is available. {budget_advice(0.75)} '
+                f'Reduce the input with -B, drop near-duplicate samples, or pass '
+                f'--ignore-memory-limit to try anyway.')
+            if self.ignore_memory:
+                self.logger.warning(f'{message} Proceeding because --ignore-memory-limit was given.')
+            else:
+                raise SystemExit(message)
+        elif estimate > available * 0.75:
+            self.logger.warning(
+                f'This run is estimated to need {human_size(estimate)} of the '
+                f'{human_size(available)} available. That is tight; if it starts '
+                f'swapping, cut the input down. {budget_advice(0.75)}')
+
     def scan_benign(self, benign_paths, rule_text, rule):
         """Return the set of pattern identifiers that match any benign file.
 
@@ -304,6 +370,7 @@ class Sigmaker:
             path_to_data[path] = data
             total_bytes += len(data)
         self.logger.info(f'Building suffix tree from {len(paths)} files ({human_size(total_bytes)} total)')
+        self.check_memory(total_bytes, len(paths))
         expected_build_time = str(datetime.timedelta(seconds=int(total_bytes/77000))) # builds about 77KB/s on my machine
         self.logger.info(f'Expected build time: {expected_build_time}')
 
@@ -445,7 +512,8 @@ if __name__ == '__main__':
                     options.bytes, 
                     options.strings,
                     options.filter,
-                    options.parallel)
+                    options.parallel,
+                    options.ignore_memory)
     sm.process(options.files, options.benign, recursive=options.recursive, output_path=options.output, rule_name=options.name, reference=options.reference, tags=options.tags, prefix=options.prefix)
 
     """

@@ -56,18 +56,59 @@ Common options:
 | `-P NAME` | pattern name prefix, e.g. `-P auto` gives `$auto_000` |
 | `-B N` | only read the first N bytes of each input file |
 | `-j N` | worker processes for the benign scan. `1` disables multiprocessing. Defaults to `min(8, physical cores / 2)` |
+| `--ignore-memory-limit` | run even when the estimated peak memory exceeds what is available |
 | `-R` | use the recursive tree traversal (see below) |
+
+## Memory is the binding constraint
+
+A generalized suffix tree is far larger than the text it indexes. Measured across
+nine runs on three malpedia families:
+
+```
+peak RSS  ~=  500 MB per MB of total input
+```
+
+Linear, with under 5% spread between families, so it is predictable enough to
+plan around. **This, not runtime, is what limits how much you can feed it** — a
+run that fits will finish, a run that does not will thrash and get OOM-killed
+after several minutes of work.
+
+sigmaker estimates the peak before building anything and compares it against
+`MemAvailable`:
+
+- over 75% of available memory — warns, and suggests a `-B` that would fit
+- over 100% — refuses to start, unless you pass `--ignore-memory-limit`
+
+The estimate is deliberately a little conservative (it assumes 550 MB/MB), since
+being wrong low means an OOM kill and being wrong high only means a warning.
+
+Rough capacity, assuming most of the machine is free:
+
+| MemAvailable | input that fits |
+|---|---|
+| 8 GB | ~11 MB |
+| 16 GB | ~22 MB |
+| 32 GB | ~44 MB |
+| 64 GB | ~87 MB |
+
+To cut input down, `-B N` reads only the first N bytes of each file. The useful
+value depends on how many samples you have: `-B (budget / number of samples)`.
+
+Deduping near-identical samples helps twice — it avoids over-fitting the rule,
+and every duplicated byte costs the same 500 MB/MB as a novel one.
 
 ## Where the time goes
 
-Almost all of it is the benign scan, not the tree:
+Two phases matter, and which one dominates depends entirely on input size:
 
 ```
-+  2.84s  tree built
-+  5.98s  common strings parsed
-+  7.99s  Testing with 26019 benign files
-+162.72s  69 remain after yara filtering
+tree build + maximal_repeats   ~4.6 s per MB of input   (grows)
+benign scan over 26k files     ~46 s at -j 4            (flat)
 ```
+
+The benign scan is fixed work for a given corpus, so it dominates small runs and
+becomes a rounding error on large ones — the crossover is around 10 MB of input.
+On 18.7 MB of real samples the tree phases take 80s of a 143s run.
 
 That phase is `-j`-parallel because every file is independent. The default is
 `min(8, physical cores / 2)` — 4 on an 8-core workstation, 8 on anything 16-core
@@ -97,15 +138,14 @@ also cannot be combined with Cython (it runs C extensions through a slow
 compatibility layer), and sigmaker leans on yara-python, which is itself a C
 extension. CPython + Cython is the faster and simpler target.
 
-Measured on 1047 KB across 2 samples:
+Measured on 1047 KB across 2 samples, all producing byte-identical output:
 
-| variant | build | maximal_repeats | total |
-|---|---|---|---|
-| before the O(n^2) fix | 7.95s | 57.41s | 65.36s |
-| pure Python | 6.69s | 3.83s | 10.52s |
-| Cython | 3.17s | 2.98s | 6.15s |
-
-All three produce byte-identical output.
+| variant | build | maximal_repeats | total | peak RSS |
+|---|---|---|---|---|
+| original | 7.95s | 57.41s | 65.36s | 1890 MB |
+| after the O(n^2) fix, pure Python | 6.69s | 3.83s | 10.52s | 1520 MB |
+| + Cython | 3.17s | 2.98s | 6.15s | 1554 MB |
+| + the `__slots__` and `left` fixes | 2.33s | 1.92s | 4.25s | 529 MB |
 
 ## The suffix-tree fork
 
@@ -142,9 +182,14 @@ The iterative path handled 100 KB of repeating bytes in both builds.
 
 Two things about the fork are easy to trip over:
 
-- `Leaf` objects are given `children = {}`, `left = {}` and `is_left_diverse`
-  attributes they do not have upstream, so that a single iterative traversal can
-  walk leaves and internal nodes uniformly.
+- `Leaf` objects are given `left` and `is_left_diverse` attributes they do not
+  have upstream, so that a single iterative traversal can walk leaves and
+  internal nodes uniformly. (They used to be given an empty `children` dict for
+  the same reason; that is gone now the traversals dispatch on type.)
+- Every class in `node.py` **and** in `lca_mixin.py` must declare `__slots__`,
+  including empty ones on the mixins. A single class without it gives every node
+  a `__dict__`, and there are ~1.5 nodes per input byte — that one omission cost
+  about 40% of peak memory.
 - Because of that, *never* test for a leaf with `if not node.children`. An
   `Internal` node can legitimately have no children (the root of an empty tree),
   and it will then take the leaf branch and fail on `node.str_id`. Use
