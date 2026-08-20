@@ -3,4 +3,3 @@
 # fixes are picked up, and only falls back to GitHub when that checkout is
 # missing.  See README.md.
 yara-python
-graphviz

@@ -4,7 +4,6 @@ import os
 import tempfile
 import time
 import datetime
-import graphviz
 import yara
 import logging
 import re
@@ -35,8 +34,6 @@ def parse_args():
       help="reference to add to yara metadata")
     arg_parser.add_argument("-t", "--tags", action="append", default=[],
       help="tags to add to yara rule. Can specify multiple times for multiple tags")
-    arg_parser.add_argument("-g", "--graph", dest="graph_path", action="store", default=None,
-      help="Save graph to provided path")
     arg_parser.add_argument("-o", "--output", action="store", default=None,
       help="Path to save the final generated rule to")
     arg_parser.add_argument("-f", "--filter", dest="filter", action="store_true", default=False,
@@ -58,7 +55,7 @@ def parse_args():
 class Sigmaker:
     # http://www.cs.ucf.edu/courses/cap5937/fall2004/Applications%20of%20suffix%20trees.pdf
 
-    def __init__(self, percent=51, minimum=5, maximum=128, bytes_to_read=0, graph_path=None, max_strings=9999, string_filter=False):
+    def __init__(self, percent=51, minimum=5, maximum=128, bytes_to_read=0, max_strings=9999, string_filter=False):
         self.logger = logging.getLogger('Sigmaker')
         self.tree = None
         self.strings = []
@@ -87,7 +84,6 @@ class Sigmaker:
             self.bytes_to_read = -1
         else:
             self.bytes_to_read = bytes_to_read
-        self.graph_path = graph_path
         
         
 
@@ -198,23 +194,6 @@ class Sigmaker:
         self.tree = Tree(path_to_data)
         self.logger.info(f'Built Ukkonen tree in {time.time()-start:4.2f}s')
         
-        if self.graph_path:
-            graph = self.tree.root.to_dot()
-            self.logger.warning(f'[+]\tSaving graph to {self.graph_path}')
-            source = graphviz.Source(graph, filename=self.graph_path, format='png')
-            # render() is what actually writes the image; view=True additionally
-            # launches a viewer.  Only do that when there is a display to launch
-            # it on -- on a headless analysis server it would block or fail.
-            has_display = bool(os.environ.get('DISPLAY') or
-                               os.environ.get('WAYLAND_DISPLAY'))
-            rendered = source.render(view=has_display)
-            self.logger.warning(f'[+]\tGraph rendered to {rendered}')
-            if not has_display:
-                self.logger.warning(
-                    '[+]\tNeither DISPLAY nor WAYLAND_DISPLAY is set; '
-                    'wrote the graph without opening a viewer')
-                
-
         i = 0
         if recursive:
             results = self.tree.maximal_repeats(recursive=True)
@@ -334,7 +313,6 @@ if __name__ == '__main__':
                     options.minimum, 
                     options.maximum, 
                     options.bytes, 
-                    options.graph_path, 
                     options.strings,
                     options.filter)
     sm.process(options.files, options.benign, recursive=options.recursive, output_path=options.output, rule_name=options.name, reference=options.reference, tags=options.tags, prefix=options.prefix)
