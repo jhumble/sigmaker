@@ -55,7 +55,33 @@ Common options:
 | `-s N` | cap the rule at N strings |
 | `-P NAME` | pattern name prefix, e.g. `-P auto` gives `$auto_000` |
 | `-B N` | only read the first N bytes of each input file |
+| `-j N` | worker processes for the benign scan. `1` disables multiprocessing. Defaults to `min(8, physical cores / 2)` |
 | `-R` | use the recursive tree traversal (see below) |
+
+## Where the time goes
+
+Almost all of it is the benign scan, not the tree:
+
+```
++  2.84s  tree built
++  5.98s  common strings parsed
++  7.99s  Testing with 26019 benign files
++162.72s  69 remain after yara filtering
+```
+
+That phase is `-j`-parallel because every file is independent. The default is
+`min(8, physical cores / 2)` — 4 on an 8-core workstation, 8 on anything 16-core
+or larger. It is deliberately conservative on both counts: the shared analysis
+server has a dozen analysts on it and two or three concurrent sigmaker runs must
+not bog it down, and leaving half the cores free keeps a workstation usable
+while a scan runs. Physical rather than logical cores because scanning is
+memory-bandwidth bound, so hyperthreads add little.
+
+Raise it with `-j 16` when you have the machine to yourself; `-j 1` restores the
+old single-process behaviour, which is worth doing if you are debugging a scan.
+
+Output does not depend on `-j`: the phase collects a set of matching pattern
+identifiers, and set union does not care what order the workers finish in.
 
 ## Which interpreter
 

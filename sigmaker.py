@@ -10,9 +10,83 @@ import re
 import uuid
 from binascii import hexlify, unhexlify
 from argparse import ArgumentParser
+from concurrent.futures import ProcessPoolExecutor
 from suffix_tree import Tree
 from util import *
 
+
+
+def physical_cores():
+    """Best-effort count of physical (not logical) cores available to us.
+
+    Scanning is memory-bandwidth bound, so hyperthreads buy far less than their
+    core count suggests and the useful ceiling is physical cores.  Bounded by
+    the CPU affinity mask so a taskset/cgroup-restricted process does not
+    oversubscribe what it was actually given.
+    """
+    try:
+        available = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        available = os.cpu_count() or 2
+
+    cores = set()
+    try:
+        with open('/proc/cpuinfo') as fp:
+            phys = core = None
+            for line in fp:
+                if line.startswith('physical id'):
+                    phys = line.split(':', 1)[1].strip()
+                elif line.startswith('core id'):
+                    core = line.split(':', 1)[1].strip()
+                elif not line.strip():
+                    if phys is not None and core is not None:
+                        cores.add((phys, core))
+                    phys = core = None
+            if phys is not None and core is not None:
+                cores.add((phys, core))
+    except OSError:
+        pass
+
+    if cores:
+        return max(1, min(len(cores), available))
+    # No /proc/cpuinfo: half the logical CPUs is the same number on any SMT box.
+    return max(1, available // 2)
+
+
+# Half the physical cores, capped at 8.  Deliberately conservative on both
+# counts: this runs on a shared analysis server where a dozen analysts may be
+# working at once, and several concurrent sigmaker runs must not bog the box
+# down.  Leaving half the cores free also keeps a workstation usable for other
+# work while a scan is going.  Raise it with -j when you have the machine to
+# yourself.
+DEFAULT_WORKERS = min(8, max(1, physical_cores() // 2))
+
+_worker_rule = None
+
+
+def _init_scan_worker(rule_source):
+    """Compile the rule once per worker process instead of once per file."""
+    global _worker_rule
+    _worker_rule = yara.compile(source=rule_source)
+
+
+def _scan_paths(paths):
+    """Return (matching pattern identifiers, [(path, error), ...]) for `paths`.
+
+    Runs in a worker process, so it returns data rather than logging. The
+    identifier set is bounded by the number of patterns in the rule, so there is
+    nothing large to ship back to the parent.
+    """
+    matched = set()
+    errors = []
+    for path in paths:
+        try:
+            for match in _worker_rule.match(path):
+                for offset, name, data in iterate_matches(match.strings):
+                    matched.add(name)
+        except Exception as e:
+            errors.append((path, str(e)))
+    return matched, errors
 
 
 def parse_args():
@@ -44,6 +118,8 @@ def parse_args():
       help="Max strings in output yara rule. If more than this number of common strings are found, progressively tighter filters (entropy and %% null bytes) are applied if using -f or the strings are sorted from most to least prevalent and chopped to this # without -f")
     arg_parser.add_argument("-b", "--benign", dest="benign", action="append", default=[],
       help="directory full of benign files to use for excluding noisy strings. Can specify multiple times to use additional directories")
+    arg_parser.add_argument("-j", "--parallel", dest="parallel", type=int, action="store", default=DEFAULT_WORKERS,
+      help=f"Worker processes to use for the benign-file scan, which dominates runtime. 1 disables multiprocessing. Default on this machine: {DEFAULT_WORKERS}")
     arg_parser.add_argument("-P", "--prefix", dest="prefix", action="store", default="auto",
       help="Prefix for pattern names (e.g., 'auto' produces $auto_000, $auto_001). Default: 'auto'")
     arg_parser.add_argument('files', nargs='+')
@@ -55,9 +131,12 @@ def parse_args():
 class Sigmaker:
     # http://www.cs.ucf.edu/courses/cap5937/fall2004/Applications%20of%20suffix%20trees.pdf
 
-    def __init__(self, percent=51, minimum=5, maximum=128, bytes_to_read=0, max_strings=9999, string_filter=False):
+    def __init__(self, percent=51, minimum=5, maximum=128, bytes_to_read=0, max_strings=9999, string_filter=False, parallel=DEFAULT_WORKERS):
         self.logger = logging.getLogger('Sigmaker')
         self.tree = None
+        if parallel < 1:
+            raise ValueError(f'Invalid parallel option: {parallel}. Must be >= 1')
+        self.parallel = parallel
         self.strings = []
         self.null_filter = .8
         self.entropy_filter = 2.5
@@ -161,6 +240,45 @@ class Sigmaker:
             exit()
              
 
+    def scan_benign(self, benign_paths, rule_text, rule):
+        """Return the set of pattern identifiers that match any benign file.
+
+        This is where a run actually spends its time -- on a 26k-file corpus it
+        is ~95% of wall clock -- and every file is independent, so it splits
+        across processes cleanly.
+        """
+        matched = set()
+        errors = []
+
+        if self.parallel <= 1 or len(benign_paths) < 2:
+            for path in benign_paths:
+                self.logger.debug(f'Scanning {path}')
+                try:
+                    for match in rule.match(path):
+                        for offset, name, data in iterate_matches(match.strings):
+                            matched.add(name)
+                except Exception as e:
+                    errors.append((path, str(e)))
+        else:
+            workers = min(self.parallel, len(benign_paths))
+            # Hand out more chunks than workers so that one chunk happening to
+            # hold several large files cannot stall the whole pass, and stride
+            # rather than slice so same-directory files (often similar sizes)
+            # are spread across chunks instead of piled into one.
+            chunks = [c for c in (benign_paths[i::workers * 4]
+                                  for i in range(workers * 4)) if c]
+            self.logger.info(f'Scanning {len(benign_paths)} benign files with {workers} workers')
+            with ProcessPoolExecutor(max_workers=workers,
+                                     initializer=_init_scan_worker,
+                                     initargs=(rule_text,)) as pool:
+                for chunk_matched, chunk_errors in pool.map(_scan_paths, chunks):
+                    matched |= chunk_matched
+                    errors.extend(chunk_errors)
+
+        for path, err in errors:
+            self.logger.warning(f'Failed to scan {path}: {err}')
+        return matched
+
     def process(self, args, benign_dirs=[], recursive=False, output_path=None, rule_name='', reference='', tags=[], prefix='auto'):
         path_to_data = {}
         strings = []
@@ -230,7 +348,13 @@ class Sigmaker:
 
         self.tree.root.post_order(print_tree)
         """
-                
+
+        # Neither the tree nor the raw result list is needed past this point,
+        # and together they hold well over a gigabyte for a few MB of input.
+        # Drop them before the benign scan forks worker processes.
+        self.tree = None
+        results = None
+
         i = 0
         start = time.time() 
         # filter_strings is O(n^2), so if the number before filtering is excessively high, chop them down some here
@@ -277,15 +401,21 @@ class Sigmaker:
             return False
 
         to_remove = set()
+        benign_paths = []
         for benign in benign_dirs:
-            paths = recursive_all_files(benign)
-            self.logger.info(f'Testing with {len(paths)} benign files from {benign}')
-            for path in paths:
-                self.logger.debug(f'Scanning {path}')
-                for match in rule.match(path):
-                    for offset, name, data in iterate_matches(match.strings):
-                            _id = int(name.split('_')[-1])  # Use [-1] to handle prefixes with underscores
-                            to_remove.add(_id)
+            found = recursive_all_files(benign)
+            self.logger.info(f'Testing with {len(found)} benign files from {benign}')
+            benign_paths.extend(found)
+
+        if benign_paths:
+            start = time.time()
+            for name in self.scan_benign(benign_paths, rule_text, rule):
+                try:
+                    # [-1] so that prefixes may themselves contain underscores
+                    to_remove.add(int(name.split('_')[-1]))
+                except ValueError:
+                    self.logger.warning(f'Could not parse a pattern id out of {name}')
+            self.logger.info(f'Scanned benign corpus in {time.time()-start:4.2f}s')
         self.logger.debug(f'Removing {to_remove}')
         for _id in sorted(list(to_remove ), reverse=True):
             try:
@@ -314,7 +444,8 @@ if __name__ == '__main__':
                     options.maximum, 
                     options.bytes, 
                     options.strings,
-                    options.filter)
+                    options.filter,
+                    options.parallel)
     sm.process(options.files, options.benign, recursive=options.recursive, output_path=options.output, rule_name=options.name, reference=options.reference, tags=options.tags, prefix=options.prefix)
 
     """
